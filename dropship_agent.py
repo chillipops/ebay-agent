@@ -139,7 +139,7 @@ def load_memory():
         "strategy_notes": [], "last_review": None,
         "total_found": 0, "best_ever": None,
         "search_terms": SEARCH_TERMS.copy(),
-        "data_source_stats": {"ebay_api": 0, "playwright": 0, "google": 0, "pricerunner": 0, "watchcount": 0, "ollama_fallback": 0},
+        "data_source_stats": {"ebay_api": 0, "playwright": 0, "google": 0, "pricerunner": 0, "watchcount": 0, "ollama_fallback": 0, "aliexpress": 0},
         "competition_history": {},  # keyword -> [{date, count, avg_price}]
         "saturated_keywords": [],
     }
@@ -725,22 +725,24 @@ async def scan_keyword_async(keyword, memory):
     if not ebay_items:
         return products, memory
 
-    # Run all data sources in parallel
+    # Run keyword-level data sources in parallel. AliExpress is deliberately
+    # NOT included here - it needs to search per individual product title
+    # (below), not once per keyword batch, otherwise every item in the batch
+    # gets priced off whatever the first item's title happened to match
+    # (e.g. a phone matching a phone ACCESSORY's price on AliExpress).
     search = " ".join(ebay_items[0]["title"].split()[:4])
-    
-    ali_task       = playwright_scrape_aliexpress(search)
+
     google_task    = scrape_google_shopping(search)
     pricerunner_task = scrape_pricerunner(search)
     watchcount_task  = scrape_watchcount(keyword)
     comp_task      = get_competition_data(keyword, memory)
 
-    ali_prices, google_prices, pricerunner_prices, watch_data, comp_data = await asyncio.gather(
-        ali_task, google_task, pricerunner_task, watchcount_task, comp_task,
+    google_prices, pricerunner_prices, watch_data, comp_data = await asyncio.gather(
+        google_task, pricerunner_task, watchcount_task, comp_task,
         return_exceptions=True
     )
 
     # Handle any errors from gather
-    if isinstance(ali_prices, Exception):        ali_prices = []
     if isinstance(google_prices, Exception):     google_prices = []
     if isinstance(pricerunner_prices, Exception):pricerunner_prices = []
     if isinstance(watch_data, Exception):        watch_data = {}
@@ -751,6 +753,14 @@ async def scan_keyword_async(keyword, memory):
     memory["data_source_stats"]["watchcount"]  = memory["data_source_stats"].get("watchcount",0) + (1 if watch_data.get("watch_count",0) > 0 else 0)
 
     for item in ebay_items[:10]:
+        item_search = " ".join(item["title"].split()[:5])
+        try:
+            ali_prices = await playwright_scrape_aliexpress(item_search)
+        except Exception as e:
+            log(f"AliExpress error for '{item_search}': {e}", "WARN")
+            ali_prices = []
+        if ali_prices: memory["data_source_stats"]["aliexpress"] = memory["data_source_stats"].get("aliexpress",0) + 1
+
         result = analyse_product(item, ali_prices, comp_data, watch_data, google_prices, pricerunner_prices)
         if result:
             products.append(result)
