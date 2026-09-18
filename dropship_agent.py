@@ -24,7 +24,8 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -61,8 +62,8 @@ REVIEW_EVERY_N     = 4
 MIN_PROFIT         = 8.00
 MAX_BUY_PRICE      = 15.00
 MAX_COMPETITION    = "Medium"
-MEMORY_FILE        = "dropship_memory.json"
-LISTINGS_FILE      = "ebay_listings.txt"
+MEMORY_FILE        = os.path.join(SCRIPT_DIR, "dropship_memory.json")
+LISTINGS_FILE      = os.path.join(SCRIPT_DIR, "ebay_listings.txt")
 USD_TO_GBP         = 0.79
 
 BLACKLIST_KEYWORDS = [
@@ -549,6 +550,12 @@ async def get_competition_data(keyword, memory):
 # ─── AliExpress Prices ────────────────────────────────────────────────────────
 
 async def playwright_scrape_aliexpress(search_term, max_items=12):
+    # AliExpress renders its results grid client-side; the sale prices only
+    # show up in the page's embedded JSON (as "salePrice":{...,"minPrice":X})
+    # once the page reaches network-idle - they're not present at
+    # domcontentloaded, and not in "US $..." text form either (the site
+    # serves prices pre-converted to the browser's locale currency, GBP
+    # here via locale="en-GB", not USD).
     try:
         from playwright.async_api import async_playwright
     except ImportError:
@@ -564,29 +571,19 @@ async def playwright_scrape_aliexpress(search_term, max_items=12):
             )
             page = await ctx.new_page()
             await page.route("**/*.{png,jpg,jpeg,gif,svg,woff}", lambda r: r.abort())
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3500)
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(2000)
             html = await page.content()
             await browser.close()
-        soup = BeautifulSoup(html, "html.parser")
-        price_els = soup.find_all(string=re.compile(r"US \$[\d.]+"))
         seen = set()
-        for el in price_els[:max_items]:
-            match = re.search(r"US \$([\d.]+)", str(el))
-            if match:
-                price_usd = float(match.group(1))
-                if 0.50 < price_usd < 20 and price_usd not in seen:
-                    seen.add(price_usd)
-                    results.append({"price_usd": price_usd, "price_gbp": gbp(price_usd), "source": "aliexpress"})
-        if not results:
-            all_text = soup.get_text()
-            for m in re.findall(r"\$([\d.]+)", all_text)[:max_items]:
-                try:
-                    p = float(m)
-                    if 0.50 < p < 20 and p not in seen:
-                        seen.add(p)
-                        results.append({"price_usd": p, "price_gbp": gbp(p), "source": "aliexpress_text"})
-                except: pass
+        matches = list(re.finditer(r'"salePrice":\{[^}]*?"minPrice":([\d.]+)', html))[:max_items]
+        for m in matches:
+            try:
+                price_gbp = float(m.group(1))
+                if 0.50 < price_gbp < 20 and price_gbp not in seen:
+                    seen.add(price_gbp)
+                    results.append({"price_usd": round(price_gbp / USD_TO_GBP, 2), "price_gbp": price_gbp, "source": "aliexpress"})
+            except: continue
         log(f"AliExpress: {len(results)} prices for '{search_term}'", "DATA")
     except Exception as e:
         log(f"AliExpress error: {e}", "WARN")
