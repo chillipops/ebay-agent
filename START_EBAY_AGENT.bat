@@ -1,3 +1,3 @@
-@echo off 
-cd C:\Users\Owner\ebay_agent 
-python dropship_agent.py 
+@echo off
+cd /d "%~dp0"
+python dropship_agent.py

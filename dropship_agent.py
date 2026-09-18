@@ -16,10 +16,23 @@ New in v3.0:
 import json, time, os, re, random, asyncio, requests
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-EBAY_APP_ID        = ""
+# "sandbox" (safe default, no live data) or "production" (real eBay data)
+EBAY_ENV        = os.getenv("EBAY_ENV", "sandbox").strip().lower()
+EBAY_DEV_ID     = os.getenv("EBAY_DEV_ID", "")
+EBAY_APP_ID     = os.getenv(f"EBAY_APP_ID_{EBAY_ENV.upper()}", "")
+EBAY_CERT_ID    = os.getenv(f"EBAY_CERT_ID_{EBAY_ENV.upper()}", "")
+EBAY_FINDING_URL = (
+    "https://svcs.sandbox.ebay.com/services/search/FindingService/v1"
+    if EBAY_ENV == "sandbox" else
+    "https://svcs.ebay.com/services/search/FindingService/v1"
+)
+
 SCRAPER_API_KEY    = ""
 OLLAMA_URL         = "http://localhost:11434/api/generate"
 OLLAMA_MODEL       = "mistral"
@@ -139,7 +152,7 @@ def ebay_api_search(keyword, max_results=25):
             "sortOrder": "BestMatch",
             "paginationInput.entriesPerPage": max_results,
         }
-        r = requests.get("https://svcs.ebay.com/services/search/FindingService/v1", params=params, timeout=15)
+        r = requests.get(EBAY_FINDING_URL, params=params, timeout=15)
         items = (r.json().get("findCompletedItemsResponse",[{}])[0]
                         .get("searchResult",[{}])[0]
                         .get("item",[]))
@@ -160,40 +173,51 @@ def ebay_api_search(keyword, max_results=25):
 # ─── DATA SOURCE 2: Playwright eBay ──────────────────────────────────────────
 
 async def playwright_scrape_ebay(keyword, max_items=20):
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        return []
+    """Session-based eBay scraper - replaces broken Playwright version."""
+    import statistics
     results = []
-    url = f"https://www.ebay.co.uk/sch/i.html?_nkw={keyword.replace(' ','+')}&LH_Sold=1&LH_Complete=1&_sop=12&_ipg=48"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+    }
     try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            ctx = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                locale="en-GB", viewport={"width": 1366, "height": 768}
-            )
-            page = await ctx.new_page()
-            await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2}", lambda route: route.abort())
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(2500)
-            html = await page.content()
-            await browser.close()
-        soup = BeautifulSoup(html, "html.parser")
+        session = requests.Session()
+        session.headers.update(headers)
+        session.get("https://www.ebay.co.uk/", timeout=15)
+        url = (
+            f"https://www.ebay.co.uk/sch/i.html"
+            f"?_nkw={keyword.replace(' ', '+')}"
+            f"&LH_Sold=1&LH_Complete=1&_sop=12&_ipg=48"
+        )
+        resp = session.get(url, timeout=20)
+        if resp.status_code != 200 or len(resp.text) < 10000:
+            log(f"Playwright eBay: blocked for '{keyword}'", "WARN")
+            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
         for item in soup.select(".s-item")[:max_items]:
             try:
                 title_el = item.select_one(".s-item__title")
                 price_el = item.select_one(".s-item__price")
                 link_el  = item.select_one(".s-item__link")
-                if not title_el or not price_el: continue
+                if not title_el or not price_el:
+                    continue
                 title = title_el.text.strip()
-                if title in ("Shop on eBay","") or is_blacklisted(title): continue
-                price_match = re.search(r"[\d.]+", price_el.text.replace("£","").replace(",",""))
-                if not price_match: continue
+                if title in ("Shop on eBay", "") or is_blacklisted(title):
+                    continue
+                price_match = re.search(r"[\d.]+", price_el.text.replace("£", "").replace(",", ""))
+                if not price_match:
+                    continue
                 price = float(price_match.group())
                 if 8 <= price <= 60:
-                    results.append({"title": title[:100], "ebay_sell_price": round(price,2), "url": link_el["href"] if link_el else "", "source": "playwright_ebay"})
-            except: continue
+                    results.append({
+                        "title": title[:100],
+                        "ebay_sell_price": round(price, 2),
+                        "url": link_el["href"] if link_el else "",
+                        "source": "requests_ebay"
+                    })
+            except:
+                continue
         log(f"Playwright eBay: {len(results)} items for '{keyword}'", "DATA")
     except Exception as e:
         log(f"Playwright eBay error: {e}", "WARN")
@@ -874,6 +898,12 @@ def main():
 """)
     log(f"Model: {OLLAMA_MODEL} | Interval: {SCAN_INTERVAL_MIN}min | Min profit: £{MIN_PROFIT}")
     log(f"Season: {get_season()} | Sources: eBay + AliExpress + Google + PriceRunner + WatchCount")
+    if EBAY_APP_ID:
+        log(f"eBay API: {EBAY_ENV.upper()} keyset ({EBAY_APP_ID})", "GOOD")
+        if EBAY_ENV == "sandbox":
+            log("Sandbox has no real sold-listing data — findCompletedItems will likely return empty. Set EBAY_ENV=production in .env for real data.", "WARN")
+    else:
+        log(f"eBay API: no {EBAY_ENV.upper()} App ID set in .env — falling back to scraping/AI estimates", "WARN")
 
     try:
         requests.get("http://localhost:11434/api/tags", timeout=4)
