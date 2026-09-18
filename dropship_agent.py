@@ -13,12 +13,18 @@ New in v3.0:
   - Competition growth tracking
 """
 
-import json, time, os, re, random, asyncio, requests
+import json, time, os, re, random, asyncio, requests, sys, base64
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-load_dotenv()
+# Windows' default console codepage can't print the emoji/box-drawing
+# characters used in logging below - force UTF-8 so it doesn't crash on launch.
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -32,6 +38,17 @@ EBAY_FINDING_URL = (
     if EBAY_ENV == "sandbox" else
     "https://svcs.ebay.com/services/search/FindingService/v1"
 )
+EBAY_OAUTH_URL = (
+    "https://api.sandbox.ebay.com/identity/v1/oauth2/token"
+    if EBAY_ENV == "sandbox" else
+    "https://api.ebay.com/identity/v1/oauth2/token"
+)
+EBAY_BROWSE_URL = (
+    "https://api.sandbox.ebay.com/buy/browse/v1/item_summary/search"
+    if EBAY_ENV == "sandbox" else
+    "https://api.ebay.com/buy/browse/v1/item_summary/search"
+)
+EBAY_MARKETPLACE_ID = "EBAY_GB"
 
 SCRAPER_API_KEY    = ""
 OLLAMA_URL         = "http://localhost:11434/api/generate"
@@ -130,39 +147,84 @@ def save_memory(mem):
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(mem, f, indent=2, ensure_ascii=False)
 
-# ─── DATA SOURCE 1: eBay API ──────────────────────────────────────────────────
+# ─── DATA SOURCE 1: eBay API (Browse API, OAuth) ─────────────────────────────
+#
+# NOTE: unlike the old Finding API's findCompletedItems, the Browse API only
+# searches ACTIVE listings - it has no "sold items" data. There is no
+# equivalent without eBay's separately-gated Marketplace Insights API.
+# "ebay_sell_price" below is therefore a current asking price from a live
+# competing listing, not a confirmed sold price.
+
+_ebay_token_cache = {"token": None, "expires_at": 0}
+
+def get_ebay_oauth_token():
+    now = time.time()
+    if _ebay_token_cache["token"] and now < _ebay_token_cache["expires_at"] - 60:
+        return _ebay_token_cache["token"]
+
+    if not EBAY_APP_ID or not EBAY_CERT_ID:
+        return None
+
+    creds = base64.b64encode(f"{EBAY_APP_ID}:{EBAY_CERT_ID}".encode()).decode()
+    try:
+        r = requests.post(
+            EBAY_OAUTH_URL,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Authorization": f"Basic {creds}",
+            },
+            data={
+                "grant_type": "client_credentials",
+                "scope": "https://api.ebay.com/oauth/api_scope",
+            },
+            timeout=15,
+        )
+        if r.status_code != 200:
+            log(f"eBay OAuth error (HTTP {r.status_code}): {r.text[:300]}", "WARN")
+            return None
+        data = r.json()
+        _ebay_token_cache["token"] = data["access_token"]
+        _ebay_token_cache["expires_at"] = now + data.get("expires_in", 7200)
+        return _ebay_token_cache["token"]
+    except Exception as e:
+        log(f"eBay OAuth error: {e}", "WARN")
+        return None
 
 def ebay_api_search(keyword, max_results=25):
     if not EBAY_APP_ID: return []
+    token = get_ebay_oauth_token()
+    if not token:
+        log("eBay API: no OAuth token available", "WARN")
+        return []
     try:
         params = {
-            "OPERATION-NAME": "findCompletedItems",
-            "SERVICE-VERSION": "1.0.0",
-            "SECURITY-APPNAME": EBAY_APP_ID,
-            "RESPONSE-DATA-FORMAT": "JSON",
-            "keywords": keyword,
-            "itemFilter(0).name": "SoldItemsOnly",
-            "itemFilter(0).value": "true",
-            "itemFilter(1).name": "Currency",
-            "itemFilter(1).value": "GBP",
-            "itemFilter(2).name": "MinPrice",
-            "itemFilter(2).value": "8",
-            "itemFilter(3).name": "MaxPrice",
-            "itemFilter(3).value": "60",
-            "sortOrder": "BestMatch",
-            "paginationInput.entriesPerPage": max_results,
+            "q": keyword,
+            "filter": "price:[8..60],priceCurrency:GBP,buyingOptions:{FIXED_PRICE}",
+            "sort": "price",
+            "limit": max_results,
         }
-        r = requests.get(EBAY_FINDING_URL, params=params, timeout=15)
-        items = (r.json().get("findCompletedItemsResponse",[{}])[0]
-                        .get("searchResult",[{}])[0]
-                        .get("item",[]))
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-EBAY-C-MARKETPLACE-ID": EBAY_MARKETPLACE_ID,
+            "Accept": "application/json",
+        }
+        r = requests.get(EBAY_BROWSE_URL, params=params, headers=headers, timeout=15)
+        try:
+            data = r.json()
+        except ValueError:
+            log(f"eBay API: non-JSON response (HTTP {r.status_code}): {r.text[:300]}", "WARN")
+            return []
+        if r.status_code != 200:
+            log(f"eBay API error (HTTP {r.status_code}): {json.dumps(data)[:300]}", "WARN")
+            return []
+        items = data.get("itemSummaries", [])
         results = []
         for item in items:
             try:
-                title = item["title"][0]
+                title = item["title"]
                 if is_blacklisted(title): continue
-                price = float(item["sellingStatus"][0]["currentPrice"][0]["__value__"])
-                results.append({"title": title, "ebay_sell_price": round(price,2), "url": item["viewItemURL"][0], "source": "ebay_api"})
+                price = float(item["price"]["value"])
+                results.append({"title": title, "ebay_sell_price": round(price,2), "url": item.get("itemWebUrl",""), "source": "ebay_api"})
             except: continue
         log(f"eBay API: {len(results)} items for '{keyword}'", "DATA")
         return results
